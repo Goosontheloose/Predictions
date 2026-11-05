@@ -305,7 +305,7 @@ right = (f'<div class="credits">{money(credits)}</div><div class="clabel">{esc(u
          if user else '<div class="clabel">Log in to play</div>')
 st.markdown(f"""
 <div class="hero">
-  <div><div class="league">Betting League</div>
+  <div><div class="league">Prediction League</div>
        <div class="sub">{week_txt}, {open_txt}</div></div>
   <div>{right}</div>
 </div>""", unsafe_allow_html=True)
