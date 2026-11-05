@@ -8,7 +8,7 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 
 # ---------------- SETTINGS ----------------
-st.set_page_config(page_title="Betting League", layout="wide")
+st.set_page_config(page_title="Prediction League", layout="wide")
 
 SHEET_NAME = "Betting League Sheet"   # name of your Google Sheet
 START_CREDITS = 100
