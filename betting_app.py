@@ -40,7 +40,9 @@ def load(name, cols):
     for c in cols:
         if c not in df.columns:
             df[c] = ""
-    return df[cols].copy()
+    df = df[cols].astype(object)  # plain columns so numbers and text can mix
+    blank = df.apply(lambda r: all(str(v).strip() == "" for v in r), axis=1)
+    return df[~blank] if len(df) else df  # index kept: sheet row = index + 2
 
 
 def refresh():
@@ -105,7 +107,24 @@ def outcome(g):
 
 
 # ---------------- SETTLEMENT ----------------
-def settle_all():
+def has_scores(g):
+    return num(g["ScoreA"]) is not None and num(g["ScoreB"]) is not None
+
+
+def result_text(g):
+    if str(g["Status"]).strip().lower() == "void":
+        return "Void: all stakes refunded"
+    h = num(g["Handicap"], 0)
+    res = outcome(g)
+    if res == "A":
+        return f"{g['TeamA']}{hcp_txt(h)} wins"
+    if res == "B":
+        return f"{g['TeamB']}{hcp_txt(-h)} wins"
+    return "Draw" if num(g["OddsDraw"]) is not None else "Tie on handicap: stakes refunded"
+
+
+def settle_game(gid):
+    """Settles only the bets on one game. Returns number of bets settled."""
     refresh()
     games = load("Games", GAME_COLS)
     users = load("Users", USER_COLS)
@@ -113,44 +132,31 @@ def settle_all():
     games["GameID"] = games["GameID"].astype(str)
     bets["GameID"] = bets["GameID"].astype(str)
 
-    payouts = {}
-    settled_games = set()
-    count = 0
+    g_idx = games.index[games["GameID"] == gid][0]
+    g = games.loc[g_idx]
+    void = str(g["Status"]).strip().lower() == "void"
+    if not void and not has_scores(g):
+        return None
 
+    payouts, count = {}, 0
     for i, b in bets.iterrows():
-        if str(b["Result"]).strip():
-            continue  # already settled
-        g = games[games["GameID"] == b["GameID"]]
-        if g.empty:
+        if b["GameID"] != gid or str(b["Result"]).strip():
             continue
-        g = g.iloc[0]
-        status = str(g["Status"]).strip().lower()
         stake = num(b["Stake"], 0)
-
-        if status == "void":
+        if void:
             result, pay = "Void", stake
-        elif num(g["ScoreA"]) is not None and num(g["ScoreB"]) is not None:
+        else:
             res = outcome(g)
             if res == b["Pick"]:
                 result, pay = "Won", round(stake * num(b["Odds"], 0), 2)
             elif res == "Draw" and num(g["OddsDraw"]) is None:
-                result, pay = "Push", stake   # tie with no draw option = refund
+                result, pay = "Push", stake
             else:
                 result, pay = "Lost", 0
-            settled_games.add(b["GameID"])
-        else:
-            continue  # no result yet
-
         bets.at[i, "Result"] = result
         bets.at[i, "Payout"] = pay
         payouts[b["User"]] = payouts.get(b["User"], 0) + pay
         count += 1
-
-    # Games with scores but no bets also get marked settled
-    for _, g in games.iterrows():
-        if num(g["ScoreA"]) is not None and num(g["ScoreB"]) is not None \
-                and str(g["Status"]).strip().lower() != "void":
-            settled_games.add(g["GameID"])
 
     for i, u in users.iterrows():
         if u["User"] in payouts:
@@ -158,14 +164,10 @@ def settle_all():
 
     overwrite("Bets", bets)
     overwrite("Users", users)
-
-    # Only touch the Status cells in the Games tab
-    ws = get_book().worksheet("Games")
-    status_col = ws.row_values(1).index("Status") + 1
-    for idx, g in games.iterrows():
-        if g["GameID"] in settled_games and str(g["Status"]).strip().lower() != "settled":
-            ws.update_cell(idx + 2, status_col, "Settled")
-
+    if not void:
+        ws = get_book().worksheet("Games")
+        col = ws.row_values(1).index("Status") + 1
+        ws.update_cell(g_idx + 2, col, "Settled")
     refresh()
     return count
 
@@ -333,11 +335,26 @@ with tab_admin:
                   else "Closed"), axis=1)
         st.dataframe(view, hide_index=True, use_container_width=True)
 
-        st.write("Enter scores in the Games tab (or set Status to Void), then:")
-        if st.button("Settle results"):
-            n = settle_all()
-            st.success(f"Settled {n} bets.")
-            st.rerun()
+        st.subheader("Settle a game")
+        st.caption("Only games with both scores entered (or Status set to Void) appear here.")
+        unsettled = set(bets[bets["Result"].astype(str).str.strip() == ""]["GameID"])
+        ready = [g for _, g in games.iterrows()
+                 if (has_scores(g) and str(g["Status"]).strip().lower() not in ("settled", "void"))
+                 or (str(g["Status"]).strip().lower() == "void" and g["GameID"] in unsettled)]
+        if not ready:
+            st.write("No games ready to settle.")
+        else:
+            labels = {f"#{g['GameID']} {g['TeamA']} {g['ScoreA']} - {g['ScoreB']} {g['TeamB']}": g
+                      for g in ready}
+            pick = st.selectbox("Game", list(labels))
+            g = labels[pick]
+            n_bets = int((bets["GameID"] == g["GameID"]).sum())
+            st.write(f"Result: **{result_text(g)}** ({n_bets} bets)")
+            if st.button("Settle this game"):
+                n = settle_game(g["GameID"])
+                st.success(f"Settled {n} bets on game #{g['GameID']}.")
+                st.rerun()
+
         if st.button("Reload data"):
             refresh()
             st.rerun()
