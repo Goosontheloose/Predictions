@@ -8,14 +8,14 @@ import streamlit as st
 from google.oauth2.service_account import Credentials
 
 # ---------------- SETTINGS ----------------
-st.set_page_config(page_title="Prediction League", layout="wide")
+st.set_page_config(page_title="Betting League", layout="wide")
 
 SHEET_NAME = "Betting League Sheet"   # name of your Google Sheet
 START_CREDITS = 100
 TZ = ZoneInfo("Africa/Johannesburg")
 
 GAME_COLS = ["GameID", "Week", "Sport", "TeamA", "TeamB", "Handicap",
-             "OddsA", "OddsB", "OddsDraw", "Cutoff", "ScoreA", "ScoreB", "Status"]
+             "OddsA", "OddsB", "OddsDraw", "Cutoff", "ScoreA", "ScoreB", "Winner", "Status"]
 USER_COLS = ["User", "PIN", "Credits"]
 BET_COLS = ["Week", "User", "GameID", "Pick", "Odds", "Stake", "Result", "Payout", "Placed"]
 
@@ -96,8 +96,18 @@ def hcp_txt(h):
     return "" if not h else f" ({h:+g})"
 
 
+def winner_value(g):
+    """A, B or Draw typed in the Winner column, else None."""
+    w = str(g["Winner"]).strip().lower()
+    return {"a": "A", "b": "B", "draw": "Draw"}.get(w)
+
+
 def outcome(g):
-    """Returns 'A', 'B' or 'Draw' after applying the handicap to TeamA."""
+    """Returns 'A', 'B' or 'Draw'. Uses the Winner column if filled,
+    otherwise the scores with the handicap applied to TeamA."""
+    w = winner_value(g)
+    if w:
+        return w
     margin = num(g["ScoreA"]) + num(g["Handicap"], 0) - num(g["ScoreB"])
     if margin > 0:
         return "A"
@@ -108,6 +118,9 @@ def outcome(g):
 
 # ---------------- SETTLEMENT ----------------
 def has_scores(g):
+    """True when the game has a result: Winner filled, or both scores."""
+    if winner_value(g):
+        return True
     return num(g["ScoreA"]) is not None and num(g["ScoreB"]) is not None
 
 
@@ -119,7 +132,7 @@ def result_text(g):
     if res == "A":
         return f"{g['TeamA']}{hcp_txt(h)} wins"
     if res == "B":
-        return f"{g['TeamB']}{hcp_txt(-h)} wins"
+        return f"{g['TeamB'] or 'Option B'}{hcp_txt(-h)} wins"
     return "Draw" if num(g["OddsDraw"]) is not None else "Tie on handicap: stakes refunded"
 
 
@@ -305,7 +318,7 @@ right = (f'<div class="credits">{money(credits)}</div><div class="clabel">{esc(u
          if user else '<div class="clabel">Log in to play</div>')
 st.markdown(f"""
 <div class="hero">
-  <div><div class="league">Prediction League</div>
+  <div><div class="league">Betting League</div>
        <div class="sub">{week_txt}, {open_txt}</div></div>
   <div>{right}</div>
 </div>""", unsafe_allow_html=True)
@@ -360,16 +373,20 @@ with tab_bet:
                     h = num(g["Handicap"], 0)
                     a_h = f"<em>{h:+g}</em>" if h else ""
                     b_h = f"<em>{-h:+g}</em>" if h else ""
+                    vs_part = (f'<span class="vs">v</span>{esc(g["TeamB"])}{b_h}'
+                               if str(g["TeamB"]).strip() else "")
                     with st.container(border=True):
                         st.markdown(f"""
 <div class="match">
   <div class="sport">{esc(g['Sport'])}</div>
-  <div class="teams">{esc(g['TeamA'])}{a_h}<span class="vs">v</span>{esc(g['TeamB'])}{b_h}</div>
+  <div class="teams">{esc(g['TeamA'])}{a_h}{vs_part}</div>
   <div class="close">{closes_text(g)}</div>
 </div>""", unsafe_allow_html=True)
-                        opts = {"No bet": None,
-                                f"{g['TeamA']}{hcp_txt(h)} @ {num(g['OddsA']):g}": ("A", num(g["OddsA"])),
-                                f"{g['TeamB']}{hcp_txt(-h)} @ {num(g['OddsB']):g}": ("B", num(g["OddsB"]))}
+                        opts = {"No bet": None}
+                        if num(g["OddsA"]) is not None:
+                            opts[f"{g['TeamA']}{hcp_txt(h)} @ {num(g['OddsA']):g}"] = ("A", num(g["OddsA"]))
+                        if num(g["OddsB"]) is not None and str(g["TeamB"]).strip():
+                            opts[f"{g['TeamB']}{hcp_txt(-h)} @ {num(g['OddsB']):g}"] = ("B", num(g["OddsB"]))
                         if num(g["OddsDraw"]) is not None:
                             opts[f"Draw @ {num(g['OddsDraw']):g}"] = ("Draw", num(g["OddsDraw"]))
                         c1, c2 = st.columns([3, 1])
@@ -463,7 +480,7 @@ with tab_mine:
                 result = str(r["Result"]).strip() or "Pending"
                 pay = money(num(r["Payout"], 0)) if result != "Pending" else ""
                 body += f"""<tr><td>{esc(r['Week'])}</td>
-<td>{esc(r['TeamA'])} v {esc(r['TeamB'])}</td><td class="big">{esc(pick)}</td>
+<td>{esc(r['TeamA'])}{(' v ' + esc(r['TeamB'])) if str(r['TeamB']).strip() else ''}</td><td class="big">{esc(pick)}</td>
 <td class="num">{num(r['Odds'], 0):g}</td><td class="num">{money(num(r['Stake'], 0))}</td>
 <td><span class="chip {result}">{result}</span></td><td class="num">{pay}</td></tr>"""
             st.markdown(f"""<div class="tbl-wrap"><table class="board">
@@ -485,7 +502,7 @@ with tab_admin:
         st.dataframe(view, hide_index=True, use_container_width=True)
 
         st.subheader("Settle a game")
-        st.caption("Only games with both scores entered (or Status set to Void) appear here.")
+        st.caption("Games appear here once they have both scores, a Winner (A, B or Draw), or Status set to Void.")
         unsettled = set(bets[bets["Result"].astype(str).str.strip() == ""]["GameID"])
         ready = [g for _, g in games.iterrows()
                  if (has_scores(g) and str(g["Status"]).strip().lower() not in ("settled", "void"))
@@ -493,7 +510,7 @@ with tab_admin:
         if not ready:
             st.write("No games ready to settle.")
         else:
-            labels = {f"#{g['GameID']} {g['TeamA']} {g['ScoreA']} - {g['ScoreB']} {g['TeamB']}": g
+            labels = {f"#{g['GameID']} {g['TeamA']}" + (f" v {g['TeamB']}" if str(g['TeamB']).strip() else ""): g
                       for g in ready}
             pick = st.selectbox("Game", list(labels))
             g = labels[pick]
