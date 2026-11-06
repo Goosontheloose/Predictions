@@ -202,38 +202,114 @@ def esc(v):
 import base64, os, re
 
 LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logos")
-COUNTRIES = {
-    "fiji": ["fiji"],
-    "japan": ["japan"],
-    "new_zealand": ["new zealand","nz"],
-    "south_africa": ["south africa","sa"],
-    "england": ["england", "eng"],
-    "wales": ["wales"],
-    "argentina": ["argentina", "argentinia", "argies", "arg"],
-    "australia": ["australia", "aus"],
-    "ireland": ["ireland"],
-    "italy": ["italy"],
-    "scotland": ["scotland"],
-    "france": ["france"],
+# stem (logo file name): (short name shown in multis, names to look for)
+COUNTRY_INFO = {
+    "fiji": ("FIJ", ["fiji", "fij"]),
+    "japan": ("JPN", ["japan", "jpn", "jap"]),
+    "new_zealand": ("NZ", ["new zealand", "nz", "all blacks"]),
+    "south_africa": ("SA", ["south africa", "sa", "rsa", "springboks", "boks"]),
+    "england": ("ENG", ["england", "eng"]),
+    "wales": ("WAL", ["wales", "wal"]),
+    "argentina": ("ARG", ["argentina", "argentinia", "argies", "arg", "pumas"]),
+    "australia": ("AUS", ["australia", "aus", "wallabies"]),
+    "ireland": ("IRE", ["ireland", "ire", "irl"]),
+    "italy": ("ITA", ["italy", "ita"]),
+    "scotland": ("SCO", ["scotland", "sco"]),
+    "france": ("FRA", ["france", "fra"]),
+    "samoa": ("SAM", ["samoa", "sam"]),
+    "tonga": ("TON", ["tonga", "ton"]),
+    "georgia": ("GEO", ["georgia", "geo"]),
+    "portugal": ("POR", ["portugal", "por"]),
+    "uruguay": ("URU", ["uruguay", "uru"]),
+    "usa": ("USA", ["usa", "united states"]),
+    "canada": ("CAN", ["canada", "can"]),
+    "romania": ("ROU", ["romania", "rou"]),
+    "spain": ("ESP", ["spain", "esp"]),
+    "chile": ("CHI", ["chile", "chi"]),
+    "namibia": ("NAM", ["namibia", "nam"]),
 }
 
+IMG_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+             "jfif": "image/jpeg", "webp": "image/webp", "svg": "image/svg+xml"}
 
-@st.cache_data
+
+def _norm(name):
+    return name.strip().lower().replace(" ", "_").replace("-", "_")
+
+
+@st.cache_data(ttl=300)
+def logo_files():
+    """{stem: file path} for every image in the logos folder.
+    'New Zealand.PNG' and 'new_zealand.png' both become 'new_zealand'."""
+    found = {}
+    if os.path.isdir(LOGO_DIR):
+        for f in os.listdir(LOGO_DIR):
+            stem, _, ext = f.rpartition(".")
+            if stem and ext.lower() in IMG_TYPES:
+                found[_norm(stem)] = os.path.join(LOGO_DIR, f)
+    return found
+
+
+def countries():
+    """Known countries plus any extra logo file in the folder (e.g. kenya.png),
+    so a new nation works just by uploading its logo."""
+    info = dict(COUNTRY_INFO)
+    for stem in logo_files():
+        if stem not in info:
+            info[stem] = (stem.replace("_", " ")[:3].upper(), [stem.replace("_", " ")])
+    return info
+
+
+@st.cache_data(ttl=300)
 def logo_uri(stem):
-    for ext, mime in (("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"),
-                      ("webp", "image/webp"), ("svg", "image/svg+xml")):
-        path = os.path.join(LOGO_DIR, f"{stem}.{ext}")
-        if os.path.exists(path):
-            with open(path, "rb") as f:
-                return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
-    return None
+    path = logo_files().get(stem)
+    if not path:
+        return None
+    with open(path, "rb") as f:
+        mime = IMG_TYPES[path.rpartition(".")[2].lower()]
+        return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
+
+
+def find_country(text):
+    """First country in the text: (start, end, stem), or None."""
+    hits = []
+    for stem, (_, names) in countries().items():
+        for n in names:
+            m = re.search(rf"\b{re.escape(n)}\b", str(text), re.IGNORECASE)
+            if m:
+                hits.append((m.start(), m.end(), stem))
+    return min(hits) if hits else None
+
+
+def is_multi(g):
+    return str(g["Sport"]).strip().lower() == "multi"
+
+
+def multi_logos(text):
+    """A multi as a row of logos. Each part is split on commas, & or +.
+    A part without a logo file is shown as text, so nothing goes missing."""
+    out = []
+    for part in re.split(r"\s*(?:,|&|\+|\band\b)\s*", str(text)):
+        if not part.strip():
+            continue
+        hit = find_country(part)
+        uri = logo_uri(hit[2]) if hit else None
+        if uri:
+            extra = (part[:hit[0]] + part[hit[1]:]).strip()  # e.g. a handicap like -26.5
+            short = countries()[hit[2]][0]
+            out.append(f'<span class="leg"><img class="mlogo" src="{uri}" alt="{esc(short)}" '
+                       f'title="{esc(part)}"><span class="code">{esc(short)}'
+                       f'{f" <em>{esc(extra)}</em>" if extra else ""}</span></span>')
+        else:
+            out.append(f'<span class="leg">{esc(part)}</span>')
+    return "".join(out)
 
 
 def with_logos(text):
     """Team name with a small logo in front of every country it mentions."""
     t = str(text)
     found = []
-    for stem, names in COUNTRIES.items():
+    for stem, (_, names) in countries().items():
         for n in names:
             m = re.search(rf"\b{re.escape(n)}\b", t, re.IGNORECASE)
             if m:
@@ -315,6 +391,22 @@ table.board tr.lead td:first-child { box-shadow: inset 4px 0 0 var(--flag); }
 .down { color: var(--loss); font-size: .85rem; margin-left: 4px; }
 img.logo { height: 1.25em; width: auto; vertical-align: -0.2em; margin-right: 6px; }
 table.board img.logo { height: 1.15em; margin-right: 4px; }
+.multi { display: flex; align-items: center; gap: 10px; margin: 6px 0; flex-wrap: wrap; }
+.multi .mlabel {
+  font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif; font-weight: 700;
+  background: var(--pitch); color: #fff; border-radius: 6px;
+  width: 1.7em; height: 1.7em; display: inline-flex; align-items: center; justify-content: center;
+}
+.multi .mlabel.b { background: var(--turf); }
+.multi .odds { color: var(--muted); font-size: .95rem; margin-left: 4px; }
+.leg { display: inline-flex; flex-direction: column; align-items: center; gap: 2px;
+       font-weight: 600; color: var(--ink); min-width: 2.6em; }
+.leg .code { font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif; font-size: .9rem;
+             letter-spacing: .5px; line-height: 1; }
+.leg em { font-style: normal; color: var(--turf); }
+img.mlogo { height: 2.1em; width: auto; border-radius: 4px; }
+table.board img.mlogo { height: 1.4em; }
+table.board .leg { margin-right: 6px; vertical-align: middle; }
 .chip { padding: 2px 9px; border-radius: 20px; font-size: .85rem; font-weight: 600; }
 .chip.Won { background: #DDF0E6; color: var(--turf); }
 .chip.Lost { background: #F8E3DA; color: var(--loss); }
@@ -439,18 +531,28 @@ with tab_bet:
                     b_h = f"<em>{-h:+g}</em>" if h else ""
                     vs_part = (f'<span class="vs">v</span>{with_logos(g["TeamB"])}{b_h}'
                                if str(g["TeamB"]).strip() else "")
+                    if is_multi(g):
+                        rows_html = ""
+                        for side, cls in (("A", ""), ("B", " b")):
+                            team, odds = g[f"Team{side}"], num(g[f"Odds{side}"])
+                            if str(team).strip() and odds is not None:
+                                rows_html += (f'<div class="multi"><span class="mlabel{cls}">{side}</span>'
+                                              f'{multi_logos(team)}<span class="odds">@ {odds:g}</span></div>')
+                        teams_html = rows_html
+                    else:
+                        teams_html = f'<div class="teams">{with_logos(g["TeamA"])}{a_h}{vs_part}</div>'
                     with st.container(border=True):
                         st.markdown(f"""
 <div class="match">
   <div class="sport">{esc(g['Sport'])}</div>
-  <div class="teams">{with_logos(g['TeamA'])}{a_h}{vs_part}</div>
+  {teams_html}
   <div class="close">{closes_text(g)}</div>
 </div>""", unsafe_allow_html=True)
                         opts = {"No bet": None}
                         if num(g["OddsA"]) is not None:
-                            opts[f"{g['TeamA']}{hcp_txt(h)} @ {num(g['OddsA']):g}"] = ("A", num(g["OddsA"]))
+                            opts[f"{'A: ' if is_multi(g) else ''}{g['TeamA']}{hcp_txt(h)} @ {num(g['OddsA']):g}"] = ("A", num(g["OddsA"]))
                         if num(g["OddsB"]) is not None and str(g["TeamB"]).strip():
-                            opts[f"{g['TeamB']}{hcp_txt(-h)} @ {num(g['OddsB']):g}"] = ("B", num(g["OddsB"]))
+                            opts[f"{'B: ' if is_multi(g) else ''}{g['TeamB']}{hcp_txt(-h)} @ {num(g['OddsB']):g}"] = ("B", num(g["OddsB"]))
                         if num(g["OddsDraw"]) is not None:
                             opts[f"Draw @ {num(g['OddsDraw']):g}"] = ("Draw", num(g["OddsDraw"]))
                         c1, c2 = st.columns([3, 1])
@@ -531,7 +633,7 @@ with tab_mine:
                     unsafe_allow_html=True)
     else:
         mine = bets[bets["User"] == user].merge(
-            games[["GameID", "TeamA", "TeamB", "Handicap"]], on="GameID", how="left")
+            games[["GameID", "Sport", "TeamA", "TeamB", "Handicap"]], on="GameID", how="left")
         if mine.empty:
             st.markdown('<div class="empty">You haven’t placed any bets yet.</div>',
                         unsafe_allow_html=True)
@@ -541,10 +643,17 @@ with tab_mine:
                 h = num(r["Handicap"], 0)
                 pick = (f"{r['TeamA']}{hcp_txt(h)}" if r["Pick"] == "A"
                         else f"{r['TeamB']}{hcp_txt(-h)}" if r["Pick"] == "B" else "Draw")
+                if is_multi(r):
+                    game_cell = "Multi"
+                    pick_cell = f"{esc(r['Pick'])}: " + multi_logos(pick) if r["Pick"] in ("A", "B") else esc(pick)
+                else:
+                    game_cell = (with_logos(r["TeamA"]) + (" v " + with_logos(r["TeamB"])
+                                 if str(r["TeamB"]).strip() else ""))
+                    pick_cell = with_logos(pick)
                 result = str(r["Result"]).strip() or "Pending"
                 pay = money(num(r["Payout"], 0)) if result != "Pending" else ""
                 body += f"""<tr><td>{esc(r['Week'])}</td>
-<td>{with_logos(r['TeamA'])}{(' v ' + with_logos(r['TeamB'])) if str(r['TeamB']).strip() else ''}</td><td class="big">{with_logos(pick)}</td>
+<td>{game_cell}</td><td class="big">{pick_cell}</td>
 <td class="num">{num(r['Odds'], 0):g}</td><td class="num">{money(num(r['Stake'], 0))}</td>
 <td><span class="chip {result}">{result}</span></td><td class="num">{pay}</td></tr>"""
             st.markdown(f"""<div class="tbl-wrap"><table class="board">
