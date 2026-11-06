@@ -195,6 +195,51 @@ import html as _html
 def esc(v):
     return _html.escape(str(v))
 
+
+# ---------------- TEAM LOGOS ----------------
+# Logo files go in a "logos" folder next to this file, named like
+# south_africa.png (png, jpg, webp or svg). Add a line here for a new team.
+import base64, os, re
+
+LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logos")
+COUNTRIES = {
+    "fiji": ["fiji"],
+    "japan": ["japan"],
+    "new_zealand": ["new zealand"],
+    "south_africa": ["south africa"],
+    "england": ["england"],
+    "wales": ["wales"],
+    "argentina": ["argentina", "argentinia", "argies"],
+    "australia": ["australia"],
+    "ireland": ["ireland"],
+}
+
+
+@st.cache_data
+def logo_uri(stem):
+    for ext, mime in (("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"),
+                      ("webp", "image/webp"), ("svg", "image/svg+xml")):
+        path = os.path.join(LOGO_DIR, f"{stem}.{ext}")
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                return f"data:{mime};base64," + base64.b64encode(f.read()).decode()
+    return None
+
+
+def with_logos(text):
+    """Team name with a small logo in front of every country it mentions."""
+    t = str(text)
+    found = []
+    for stem, names in COUNTRIES.items():
+        for n in names:
+            m = re.search(rf"\b{re.escape(n)}\b", t, re.IGNORECASE)
+            if m:
+                found.append((m.start(), stem))
+                break
+    imgs = "".join(f'<img class="logo" src="{logo_uri(stem)}" alt="">'
+                   for _, stem in sorted(found) if logo_uri(stem))
+    return imgs + esc(t)
+
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@500;600;700&family=Barlow:wght@400;500;600&display=swap');
@@ -265,6 +310,8 @@ table.board tr.lead td:first-child { box-shadow: inset 4px 0 0 var(--flag); }
 .big { font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif; font-size: 1.3rem; font-weight: 600; }
 .up { color: var(--turf); font-size: .85rem; margin-left: 4px; }
 .down { color: var(--loss); font-size: .85rem; margin-left: 4px; }
+img.logo { height: 1.25em; width: auto; vertical-align: -0.2em; margin-right: 6px; }
+table.board img.logo { height: 1.15em; margin-right: 4px; }
 .chip { padding: 2px 9px; border-radius: 20px; font-size: .85rem; font-weight: 600; }
 .chip.Won { background: #DDF0E6; color: var(--turf); }
 .chip.Lost { background: #F8E3DA; color: var(--loss); }
@@ -387,13 +434,13 @@ with tab_bet:
                     h = num(g["Handicap"], 0)
                     a_h = f"<em>{h:+g}</em>" if h else ""
                     b_h = f"<em>{-h:+g}</em>" if h else ""
-                    vs_part = (f'<span class="vs">v</span>{esc(g["TeamB"])}{b_h}'
+                    vs_part = (f'<span class="vs">v</span>{with_logos(g["TeamB"])}{b_h}'
                                if str(g["TeamB"]).strip() else "")
                     with st.container(border=True):
                         st.markdown(f"""
 <div class="match">
   <div class="sport">{esc(g['Sport'])}</div>
-  <div class="teams">{esc(g['TeamA'])}{a_h}{vs_part}</div>
+  <div class="teams">{with_logos(g['TeamA'])}{a_h}{vs_part}</div>
   <div class="close">{closes_text(g)}</div>
 </div>""", unsafe_allow_html=True)
                         opts = {"No bet": None}
@@ -494,7 +541,7 @@ with tab_mine:
                 result = str(r["Result"]).strip() or "Pending"
                 pay = money(num(r["Payout"], 0)) if result != "Pending" else ""
                 body += f"""<tr><td>{esc(r['Week'])}</td>
-<td>{esc(r['TeamA'])}{(' v ' + esc(r['TeamB'])) if str(r['TeamB']).strip() else ''}</td><td class="big">{esc(pick)}</td>
+<td>{with_logos(r['TeamA'])}{(' v ' + with_logos(r['TeamB'])) if str(r['TeamB']).strip() else ''}</td><td class="big">{with_logos(pick)}</td>
 <td class="num">{num(r['Odds'], 0):g}</td><td class="num">{money(num(r['Stake'], 0))}</td>
 <td><span class="chip {result}">{result}</span></td><td class="num">{pay}</td></tr>"""
             st.markdown(f"""<div class="tbl-wrap"><table class="board">
