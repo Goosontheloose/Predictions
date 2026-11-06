@@ -99,7 +99,7 @@ def hcp_txt(h):
 def winner_value(g):
     """A, B or Draw typed in the Winner column, else None."""
     w = str(g["Winner"]).strip().lower()
-    return {"a": "A", "b": "B", "draw": "Draw"}.get(w)
+    return {"a": "A", "b": "B", "draw": "Draw", "c": "None"}.get(w)
 
 
 def outcome(g):
@@ -129,6 +129,8 @@ def result_text(g):
         return "Void: all stakes refunded"
     h = num(g["Handicap"], 0)
     res = outcome(g)
+    if res == "None":
+        return "Neither won: all bets lost"
     if res == "A":
         return f"{g['TeamA']}{hcp_txt(h)} wins"
     if res == "B":
@@ -148,6 +150,8 @@ def settle_game(gid):
     g_idx = games.index[games["GameID"] == gid][0]
     g = games.loc[g_idx]
     void = str(g["Status"]).strip().lower() == "void"
+    if str(g["Status"]).strip().lower() == "settled":
+        return 0  # already done by someone else
     if not void and not has_scores(g):
         return None
 
@@ -302,6 +306,16 @@ users = load("Users", USER_COLS)
 bets = load("Bets", BET_COLS)
 games["GameID"] = games["GameID"].astype(str)
 bets["GameID"] = bets["GameID"].astype(str)
+
+# ---------------- AUTO-SETTLE ----------------
+# Typing "Settle" in a game's Status column settles it the next time
+# anyone opens the app. The app then changes the Status to "Settled".
+to_settle = [g["GameID"] for _, g in games.iterrows()
+             if str(g["Status"]).strip().lower() == "settle" and has_scores(g)]
+if to_settle:
+    for gid in to_settle:
+        settle_game(gid)
+    st.rerun()
 
 user = st.session_state.user
 me = users[users["User"] == user] if user else users.iloc[0:0]
@@ -502,7 +516,7 @@ with tab_admin:
         st.dataframe(view, hide_index=True, use_container_width=True)
 
         st.subheader("Settle a game")
-        st.caption("Games appear here once they have both scores, a Winner (A, B or Draw), or Status set to Void.")
+        st.caption("Games appear here once they have both scores, a Winner (A, B, C or Draw), or Status set to Void.")
         unsettled = set(bets[bets["Result"].astype(str).str.strip() == ""]["GameID"])
         ready = [g for _, g in games.iterrows()
                  if (has_scores(g) and str(g["Status"]).strip().lower() not in ("settled", "void"))
