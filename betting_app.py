@@ -18,6 +18,7 @@ GAME_COLS = ["GameID", "Week", "Sport", "TeamA", "TeamB", "Handicap",
              "OddsA", "OddsB", "OddsDraw", "Cutoff", "ScoreA", "ScoreB", "Winner", "Status"]
 USER_COLS = ["User", "PIN", "Credits"]
 BET_COLS = ["Week", "User", "GameID", "Pick", "Odds", "Stake", "Result", "Payout", "Placed"]
+LOCK_COLS = ["GameID", "User", "Locked"]   # one row per locked bet
 
 
 # ---------------- GOOGLE SHEETS ----------------
@@ -32,7 +33,16 @@ def get_book():
 
 @st.cache_data(ttl=30)
 def read_tab(name):
-    return get_book().worksheet(name).get_all_records()
+    book = get_book()
+    try:
+        ws = book.worksheet(name)
+    except gspread.WorksheetNotFound:
+        if name != "BetLocks":
+            raise
+        # The BetLocks tab is made automatically the first time it is needed
+        ws = book.add_worksheet(title="BetLocks", rows=1000, cols=len(LOCK_COLS))
+        ws.append_row(LOCK_COLS)
+    return ws.get_all_records()
 
 
 def load(name, cols):
@@ -412,6 +422,16 @@ table.board .leg { margin-right: 6px; vertical-align: middle; }
 .chip.Lost { background: #F8E3DA; color: var(--loss); }
 .chip.Push, .chip.Void, .chip.Pending { background: #ECEFED; color: var(--muted); }
 .empty { color: var(--muted); padding: 24px 0; }
+h3.week-title {
+  font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif; font-weight: 700;
+  font-size: 1.5rem; color: var(--pitch); margin: 1rem 0 .4rem;
+}
+.lockbar { background: #FFF8E1; border-left: 4px solid var(--flag); padding: 10px 14px;
+           border-radius: 6px; margin: 4px 0 10px; color: var(--ink); }
+.lockhelp { color: var(--muted); font-size: .92rem; margin: 6px 0 2px; }
+.game-head { font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif; font-weight: 600;
+             font-size: 1.25rem; color: var(--ink); margin: 14px 0 4px; }
+.chip.Locked { background: #E3EAF6; color: #2B4A7A; }
 
 .stButton button, .stFormSubmitButton button {
   background: var(--pitch); color: #fff; border: none; font-weight: 600;
@@ -439,6 +459,99 @@ def money(v):
     return f"{v:,.2f}".rstrip("0").rstrip(".")
 
 
+def wk(v):
+    """Week as text, so 1, 1.0 and "1" are the same week."""
+    n = num(v)
+    return str(int(n)) if n is not None and n == int(n) else str(v).strip()
+
+
+def pick_label(g, pick):
+    h = num(g["Handicap"], 0)
+    if pick == "A":
+        return f"{'A: ' if is_multi(g) else ''}{g['TeamA']}{hcp_txt(h)}"
+    if pick == "B":
+        return f"{'B: ' if is_multi(g) else ''}{g['TeamB']}{hcp_txt(-h)}"
+    return "Draw"
+
+
+def pick_html(g, pick):
+    if is_multi(g) and pick in ("A", "B"):
+        return f"{pick}: " + multi_logos(g[f"Team{pick}"])
+    return with_logos(pick_label(g, pick))
+
+
+def game_title_html(g):
+    if is_multi(g):
+        return "Multi"
+    b = f" v {with_logos(g['TeamB'])}" if str(g["TeamB"]).strip() else ""
+    return with_logos(g["TeamA"]) + b
+
+
+def game_card_html(g):
+    h = num(g["Handicap"], 0)
+    if is_multi(g):
+        teams_html = ""
+        for side, cls in (("A", ""), ("B", " b")):
+            team, odds = g[f"Team{side}"], num(g[f"Odds{side}"])
+            if str(team).strip() and odds is not None:
+                teams_html += (f'<div class="multi"><span class="mlabel{cls}">{side}</span>'
+                               f'{multi_logos(team)}<span class="odds">@ {odds:g}</span></div>')
+    else:
+        a_h = f"<em>{h:+g}</em>" if h else ""
+        b_h = f"<em>{-h:+g}</em>" if h else ""
+        vs_part = (f'<span class="vs">v</span>{with_logos(g["TeamB"])}{b_h}'
+                   if str(g["TeamB"]).strip() else "")
+        teams_html = f'<div class="teams">{with_logos(g["TeamA"])}{a_h}{vs_part}</div>'
+    return f"""
+<div class="match">
+  <div class="sport">{esc(g['Sport'])}</div>
+  {teams_html}
+  <div class="close">{closes_text(g)}</div>
+</div>"""
+
+
+def save_picks(user, wgames, new, lock):
+    """Replaces the user's saved (unlocked) bets on these open games with the new ones.
+    Old stakes are given back first. With lock=True the new bets are locked.
+    Returns an error message, or None if it worked."""
+    refresh()
+    users_now = load("Users", USER_COLS)
+    bets_now = load("Bets", BET_COLS)
+    locks_now = load("BetLocks", LOCK_COLS)
+    bets_now["GameID"] = bets_now["GameID"].astype(str)
+
+    gids = {g["GameID"] for g in wgames}
+    locked_now = set(locks_now.loc[locks_now["User"] == user, "GameID"].astype(str))
+    if gids & locked_now:
+        return "One of these bets was already locked. Refresh the page and try again."
+    if any(not is_open(g) for g in wgames):
+        return "Betting has closed on one of these games. Refresh the page and try again."
+
+    old = bets_now[(bets_now["User"] == user) & bets_now["GameID"].isin(gids)
+                   & (bets_now["Result"].astype(str).str.strip() == "")]
+    row = users_now.index[users_now["User"] == user][0]
+    available = num(users_now.at[row, "Credits"], 0) + sum(num(x, 0) for x in old["Stake"])
+    total = sum(p[3] for p in new)
+    if total > available:
+        return f"These bets total {money(total)}, but you have {money(available)} credits."
+
+    stamp = now().strftime("%Y-%m-%d %H:%M")
+    ws_b = get_book().worksheet("Bets")
+    for idx in sorted(old.index, reverse=True):  # bottom first so row numbers stay right
+        ws_b.delete_rows(int(idx) + 2)
+    if new:
+        ws_b.append_rows([[g["Week"], user, g["GameID"], pk, odds, stake, "", "", stamp]
+                          for g, pk, odds, stake in new], value_input_option="RAW")
+    ws_u = get_book().worksheet("Users")
+    col = ws_u.row_values(1).index("Credits") + 1
+    ws_u.update_cell(int(row) + 2, col, round(available - total, 2))
+    if lock and new:
+        get_book().worksheet("BetLocks").append_rows(
+            [[g["GameID"], user, stamp] for g, *_ in new], value_input_option="RAW")
+    refresh()
+    return None
+
+
 # ---------------- DATA ----------------
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -446,6 +559,8 @@ if "user" not in st.session_state:
 games = load("Games", GAME_COLS)
 users = load("Users", USER_COLS)
 bets = load("Bets", BET_COLS)
+locks = load("BetLocks", LOCK_COLS)
+locks["GameID"] = locks["GameID"].astype(str)
 games["GameID"] = games["GameID"].astype(str)
 bets["GameID"] = bets["GameID"].astype(str)
 
@@ -485,8 +600,9 @@ if user:
         st.session_state.user = None
         st.rerun()
 
-tab_bet, tab_board, tab_mine, tab_admin = st.tabs(
-    ["Place bets", "Leaderboard", "My bets", "Admin"])
+tab_bet, tab_all, tab_board, tab_mine, tab_admin = st.tabs(
+    ["Place bets", "Everyone's picks", "Leaderboard", "My bets", "Admin"])
+my_locked = set(locks.loc[locks["User"] == user, "GameID"]) if user else set()  # GameIDs
 
 # ---------------- PLACE BETS ----------------
 with tab_bet:
@@ -516,76 +632,129 @@ with tab_bet:
                     else:
                         st.error("Name or PIN is wrong. Check both and try again.")
     else:
-        already = set(bets[bets["User"] == user]["GameID"])
-        open_games = [g for g in open_all if g["GameID"] not in already]
+        if st.session_state.get("flash"):
+            st.success(st.session_state.pop("flash"))
+        open_weeks = sorted({wk(g["Week"]) for g in open_all}, key=lambda w: num(w, 0))
+        my_open = bets[(bets["User"] == user) & (bets["Result"].astype(str).str.strip() == "")]
+        saved = {b["GameID"]: b for _, b in my_open.iterrows()}
 
-        if not open_games:
+        if not open_weeks:
             st.markdown('<div class="empty">No games to bet on right now. '
-                        'Your placed bets are under My bets.</div>', unsafe_allow_html=True)
-        else:
-            with st.form("bets"):
-                picks = []
-                for g in open_games:
-                    h = num(g["Handicap"], 0)
-                    a_h = f"<em>{h:+g}</em>" if h else ""
-                    b_h = f"<em>{-h:+g}</em>" if h else ""
-                    vs_part = (f'<span class="vs">v</span>{with_logos(g["TeamB"])}{b_h}'
-                               if str(g["TeamB"]).strip() else "")
-                    if is_multi(g):
-                        rows_html = ""
-                        for side, cls in (("A", ""), ("B", " b")):
-                            team, odds = g[f"Team{side}"], num(g[f"Odds{side}"])
-                            if str(team).strip() and odds is not None:
-                                rows_html += (f'<div class="multi"><span class="mlabel{cls}">{side}</span>'
-                                              f'{multi_logos(team)}<span class="odds">@ {odds:g}</span></div>')
-                        teams_html = rows_html
-                    else:
-                        teams_html = f'<div class="teams">{with_logos(g["TeamA"])}{a_h}{vs_part}</div>'
+                        'Your bets are under My bets.</div>', unsafe_allow_html=True)
+
+        for week in open_weeks:
+            wgames = [g for g in open_all if wk(g["Week"]) == week]
+            st.markdown(f'<h3 class="week-title">Week {esc(week)}</h3>', unsafe_allow_html=True)
+
+            locked_games = [g for g in wgames if g["GameID"] in my_locked]
+            wgames = [g for g in wgames if g["GameID"] not in my_locked]
+            for g in locked_games:
+                b = saved.get(g["GameID"])
+                with st.container(border=True):
+                    st.markdown(game_card_html(g) + (
+                        f'<div class="lockbar">🔒 Locked: <b>{pick_html(g, b["Pick"])}</b>, '
+                        f'{money(num(b["Stake"], 0))} credits. See what everyone picked under '
+                        f'<b>Everyone\'s picks</b>.</div>' if b is not None else ""),
+                        unsafe_allow_html=True)
+            if not wgames:
+                continue
+
+            with st.form(f"bets_{week}"):
+                new = []
+                for g in wgames:
                     with st.container(border=True):
-                        st.markdown(f"""
-<div class="match">
-  <div class="sport">{esc(g['Sport'])}</div>
-  {teams_html}
-  <div class="close">{closes_text(g)}</div>
-</div>""", unsafe_allow_html=True)
+                        st.markdown(game_card_html(g), unsafe_allow_html=True)
                         opts = {"No bet": None}
                         if num(g["OddsA"]) is not None:
-                            opts[f"{'A: ' if is_multi(g) else ''}{g['TeamA']}{hcp_txt(h)} @ {num(g['OddsA']):g}"] = ("A", num(g["OddsA"]))
+                            opts[f"{pick_label(g, 'A')} @ {num(g['OddsA']):g}"] = ("A", num(g["OddsA"]))
                         if num(g["OddsB"]) is not None and str(g["TeamB"]).strip():
-                            opts[f"{'B: ' if is_multi(g) else ''}{g['TeamB']}{hcp_txt(-h)} @ {num(g['OddsB']):g}"] = ("B", num(g["OddsB"]))
+                            opts[f"{pick_label(g, 'B')} @ {num(g['OddsB']):g}"] = ("B", num(g["OddsB"]))
                         if num(g["OddsDraw"]) is not None:
                             opts[f"Draw @ {num(g['OddsDraw']):g}"] = ("Draw", num(g["OddsDraw"]))
+
+                        old = saved.get(g["GameID"])
+                        idx = 0
+                        if old is not None:
+                            idx = next((i for i, v in enumerate(opts.values())
+                                        if v and v[0] == old["Pick"]), 0)
                         c1, c2 = st.columns([3, 1])
-                        choice = c1.radio("Your pick", list(opts), key=f"p{g['GameID']}")
+                        choice = c1.radio("Your pick", list(opts), index=idx, key=f"p{g['GameID']}")
                         stake = c2.number_input("Credits", min_value=0, step=1,
+                                                value=int(num(old["Stake"], 0)) if old is not None else 0,
                                                 key=f"s{g['GameID']}")
+                        if old is not None:
+                            st.caption(f"Saved: {pick_label(g, old['Pick'])}, "
+                                       f"{money(num(old['Stake'], 0))} credits")
                         if opts[choice] and stake > 0:
-                            picks.append((g, *opts[choice], stake))
-                submitted = st.form_submit_button("Place bets", use_container_width=True)
+                            new.append((g, *opts[choice], stake))
 
-            if submitted:
-                refresh()
-                users_now = load("Users", USER_COLS)
-                row = users_now.index[users_now["User"] == user][0]
-                credits_now = num(users_now.at[row, "Credits"], 0)
-                total = sum(p[3] for p in picks)
+                st.markdown('<div class="lockhelp">Save as often as you like until the games start. '
+                            'Locking makes the bets you’ve picked final and shows you what everyone '
+                            'else picked on those games. Games without a bet stay open.</div>',
+                            unsafe_allow_html=True)
+                sure = st.checkbox("I’m sure, lock these bets", key=f"sure{week}")
+                b1, b2 = st.columns(2)
+                save = b1.form_submit_button("Save picks", use_container_width=True)
+                lock = b2.form_submit_button("Save and lock 🔒", use_container_width=True)
 
-                if not picks:
-                    st.warning("Pick a team and enter credits for at least one game.")
-                elif total > credits_now:
-                    st.error(f"These bets total {money(total)}, but you have {money(credits_now)} credits.")
-                elif any(not is_open(p[0]) for p in picks):
-                    st.error("Betting has closed on one of these games. Remove it and try again.")
+            if save or lock:
+                if lock and not sure:
+                    st.warning("Tick “I’m sure” first. Once locked, your bets can’t be changed.")
+                elif lock and not new:
+                    st.warning("Pick a team and enter credits first. Only games with a bet get locked.")
                 else:
-                    stamp = now().strftime("%Y-%m-%d %H:%M")
-                    get_book().worksheet("Bets").append_rows(
-                        [[p[0]["Week"], user, p[0]["GameID"], p[1], p[2], p[3], "", "", stamp]
-                         for p in picks], value_input_option="RAW")
-                    ws_u = get_book().worksheet("Users")
-                    col = ws_u.row_values(1).index("Credits") + 1
-                    ws_u.update_cell(row + 2, col, round(credits_now - total, 2))
-                    refresh()
-                    st.rerun()
+                    err = save_picks(user, wgames, new, lock)
+                    if err:
+                        st.error(err)
+                    else:
+                        st.session_state["flash"] = ("Bets saved and locked." if lock
+                                                     else "Bets saved. You can still change them.")
+                        st.rerun()
+
+# ---------------- EVERYONE'S PICKS ----------------
+with tab_all:
+    if not user:
+        st.markdown('<div class="empty">Log in on the Place bets tab to see everyone’s picks.</div>',
+                    unsafe_allow_html=True)
+    else:
+        weeks_all = sorted({wk(g["Week"]) for _, g in games.iterrows()}, key=lambda w: num(w, 0),
+                           reverse=True)
+        shown = False
+        for week in weeks_all:
+            wgames = [g for _, g in games.iterrows() if wk(g["Week"]) == week]
+            # A game's picks show once you've locked that week, or once betting on it has closed
+            visible = [g for g in wgames if g["GameID"] in my_locked or not is_open(g)]
+            hidden = len(wgames) - len(visible)
+            if not visible and not hidden:
+                continue
+            st.markdown(f'<h3 class="week-title">Week {esc(week)}</h3>', unsafe_allow_html=True)
+            shown = True
+            if hidden:
+                st.markdown(f'<div class="lockbar">🔒 {hidden} game{"s are" if hidden > 1 else " is"} '
+                            f'hidden. Lock your bet on a game (Place bets tab) to see what everyone '
+                            f'picked on it.</div>', unsafe_allow_html=True)
+            for g in visible:
+                gb = bets[bets["GameID"] == g["GameID"]]
+                if gb.empty:
+                    continue
+                rows = ""
+                for _, b in gb.iterrows():
+                    res = str(b["Result"]).strip()
+                    if res:
+                        status_chip = f'<span class="chip {res}">{res}</span>'
+                    elif ((locks["GameID"] == g["GameID"]) & (locks["User"] == b["User"])).any():
+                        status_chip = '<span class="chip Locked">Locked</span>'
+                    elif is_open(g):
+                        status_chip = '<span class="chip Pending">Can still change</span>'
+                    else:
+                        status_chip = '<span class="chip Pending">Pending</span>'
+                    rows += (f'<tr><td class="big">{esc(b["User"])}</td><td>{pick_html(g, b["Pick"])}</td>'
+                             f'<td class="num">{money(num(b["Stake"], 0))}</td><td>{status_chip}</td></tr>')
+                st.markdown(f"""<div class="game-head">{game_title_html(g)}</div>
+<div class="tbl-wrap"><table class="board"><tr><th>Player</th><th>Pick</th>
+<th class="num">Credits</th><th>Status</th></tr>{rows}</table></div>""", unsafe_allow_html=True)
+        if not shown:
+            st.markdown('<div class="empty">No picks to show yet.</div>', unsafe_allow_html=True)
 
 # ---------------- LEADERBOARD ----------------
 with tab_board:
