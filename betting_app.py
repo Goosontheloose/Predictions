@@ -205,14 +205,16 @@ LOGO_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logos")
 COUNTRIES = {
     "fiji": ["fiji"],
     "japan": ["japan"],
-    "new_zealand": ["new zealand"],
-    "south_africa": ["south africa"],
+    "new_zealand": ["new zealand","nz"],
+    "south_africa": ["south africa","sa"],
     "england": ["england"],
     "wales": ["wales"],
     "argentina": ["argentina", "argentinia", "argies"],
     "australia": ["australia"],
     "ireland": ["ireland"],
     "italy": ["italy"],
+    "scotland": ["scotland"],
+    "france": ["france"],
 }
 
 
