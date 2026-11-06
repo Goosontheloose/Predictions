@@ -212,6 +212,7 @@ COUNTRIES = {
     "argentina": ["argentina", "argentinia", "argies"],
     "australia": ["australia"],
     "ireland": ["ireland"],
+    "italy": ["italy"],
 }
 
 
