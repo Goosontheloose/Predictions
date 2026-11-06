@@ -431,6 +431,22 @@ h3.week-title {
 .lockhelp { color: var(--muted); font-size: .92rem; margin: 6px 0 2px; }
 .game-head { font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif; font-weight: 600;
              font-size: 1.25rem; color: var(--ink); margin: 14px 0 4px; }
+.creditbar {
+  position: fixed; left: 50%; transform: translateX(-50%); z-index: 999;
+  bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  background: var(--pitch); color: #fff; border-radius: 30px;
+  padding: 8px 20px; display: flex; align-items: baseline; gap: 8px;
+  box-shadow: 0 6px 18px rgba(0,0,0,.18); border: 2px solid var(--flag);
+  white-space: nowrap; font-size: .9rem;
+}
+.creditbar span { color: #B9D3C7; }
+.creditbar b {
+  font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif; font-weight: 600;
+  font-size: 1.6rem; line-height: 1; color: var(--flag);
+}
+.creditbar.over { border-color: var(--loss); background: #5A1E0B; }
+.creditbar.over b { color: #FFD2C2; }
+.block-container { padding-bottom: 6rem; }
 .chip.Locked { background: #E3EAF6; color: #2B4A7A; }
 
 .stButton button, .stFormSubmitButton button {
@@ -642,6 +658,10 @@ with tab_bet:
             st.markdown('<div class="empty">No games to bet on right now. '
                         'Your bets are under My bets.</div>', unsafe_allow_html=True)
 
+        # For the live "credits left" bar: stakes already saved on games that can
+        # still be changed go back into the pot, then whatever is typed now comes off.
+        live = {"saved": 0.0, "typed": 0.0}
+
         for week in open_weeks:
             wgames = [g for g in open_all if wk(g["Week"]) == week]
             st.markdown(f'<h3 class="week-title">Week {esc(week)}</h3>', unsafe_allow_html=True)
@@ -659,7 +679,7 @@ with tab_bet:
             if not wgames:
                 continue
 
-            with st.form(f"bets_{week}"):
+            with st.container():
                 new = []
                 for g in wgames:
                     with st.container(border=True):
@@ -685,8 +705,11 @@ with tab_bet:
                         if old is not None:
                             st.caption(f"Saved: {pick_label(g, old['Pick'])}, "
                                        f"{money(num(old['Stake'], 0))} credits")
+                        if old is not None:
+                            live["saved"] += num(old["Stake"], 0)
                         if opts[choice] and stake > 0:
                             new.append((g, *opts[choice], stake))
+                            live["typed"] += stake
 
                 st.markdown('<div class="lockhelp">Save as often as you like until the games start. '
                             'Locking makes the bets you’ve picked final and shows you what everyone '
@@ -694,8 +717,8 @@ with tab_bet:
                             unsafe_allow_html=True)
                 sure = st.checkbox("I’m sure, lock these bets", key=f"sure{week}")
                 b1, b2 = st.columns(2)
-                save = b1.form_submit_button("Save picks", use_container_width=True)
-                lock = b2.form_submit_button("Save and lock 🔒", use_container_width=True)
+                save = b1.button("Save picks", key=f"save{week}", use_container_width=True)
+                lock = b2.button("Save and lock 🔒", key=f"lock{week}", use_container_width=True)
 
             if save or lock:
                 if lock and not sure:
@@ -710,6 +733,18 @@ with tab_bet:
                         st.session_state["flash"] = ("Bets saved and locked." if lock
                                                      else "Bets saved. You can still change them.")
                         st.rerun()
+
+        # Credits bar that stays on screen while scrolling (Place bets tab only)
+        if open_weeks and credits is not None:
+            left = credits + live["saved"] - live["typed"]
+            unsaved = abs(live["typed"] - live["saved"]) > 0.001
+            if left < 0:
+                bar = (f'<div class="creditbar over"><span>Over by</span>'
+                       f'<b>{money(-left)}</b><span>credits</span></div>')
+            else:
+                bar = (f'<div class="creditbar"><span>Credits left</span><b>{money(left)}</b>'
+                       f'<span>{"after these picks" if unsaved else "of " + money(credits + live["saved"])}</span></div>')
+            st.markdown(bar, unsafe_allow_html=True)
 
 # ---------------- EVERYONE'S PICKS ----------------
 with tab_all:
