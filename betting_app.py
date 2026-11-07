@@ -568,6 +568,52 @@ def save_picks(user, wgames, new, lock):
     return None
 
 
+# ---------------- REMEMBER ME (cookie) ----------------
+# After logging in, the browser keeps a signed cookie. Next time the app opens,
+# the cookie logs the user in. Changing a PIN or logging out cancels it.
+import hmac
+import json
+import streamlit.components.v1 as components
+
+COOKIE = "betting_league_login"
+COOKIE_DAYS = 90
+
+
+def _sign(name, pin_hash):
+    key = str(st.secrets["connections"]["gsheets"]["private_key"]).encode()
+    return hmac.new(key, f"{name}|{pin_hash}".encode(), hashlib.sha256).hexdigest()[:40]
+
+
+def make_token(name, pin_hash):
+    raw = base64.urlsafe_b64encode(str(name).encode()).decode().rstrip("=")
+    return f"{raw}.{_sign(name, pin_hash)}"
+
+
+def user_from_token(token, users_df):
+    try:
+        raw, sig = str(token).split(".", 1)
+        name = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4)).decode()
+    except Exception:
+        return None
+    match = users_df[users_df["User"].astype(str) == name]
+    if match.empty or not hmac.compare_digest(sig, _sign(name, match.iloc[0]["PIN"])):
+        return None
+    return name
+
+
+def write_cookie(value, days):
+    """Sets (or with days=0 deletes) the login cookie in the browser."""
+    js = f"""<script>
+      const secure = window.parent.location.protocol === "https:" ? "; Secure" : "";
+      window.parent.document.cookie = {json.dumps(COOKIE)} + "=" + {json.dumps(value)}
+        + "; max-age={days * 86400}; path=/; SameSite=Lax" + secure;
+    </script>"""
+    if hasattr(st, "iframe"):          # newer Streamlit
+        st.iframe(js, height=1)
+    else:                              # older Streamlit
+        components.html(js, height=0)
+
+
 # ---------------- DATA ----------------
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -579,6 +625,20 @@ locks = load("BetLocks", LOCK_COLS)
 locks["GameID"] = locks["GameID"].astype(str)
 games["GameID"] = games["GameID"].astype(str)
 bets["GameID"] = bets["GameID"].astype(str)
+
+# Auto-login from the cookie (skipped after logging out in this visit)
+if st.session_state.user is None and not st.session_state.get("logged_out"):
+    try:
+        token = st.context.cookies.get(COOKIE)
+    except Exception:
+        token = None
+    if token:
+        st.session_state.user = user_from_token(token, users)
+
+# Cookie changes requested on the previous run (login or logout)
+if "cookie_todo" in st.session_state:
+    value, days = st.session_state.pop("cookie_todo")
+    write_cookie(value, days)
 
 # ---------------- AUTO-SETTLE ----------------
 # Typing "Settle" in a game's Status column settles it the next time
@@ -614,6 +674,8 @@ if user:
     _, c = st.columns([5, 1])
     if c.button("Log out", use_container_width=True):
         st.session_state.user = None
+        st.session_state.logged_out = True
+        st.session_state.cookie_todo = ("", 0)   # delete the remember-me cookie
         st.rerun()
 
 tab_bet, tab_all, tab_board, tab_mine, tab_admin = st.tabs(
@@ -628,6 +690,7 @@ with tab_bet:
                             label_visibility="collapsed")
             name = st.text_input("Name").strip()
             pin = st.text_input("PIN", type="password")
+            remember = st.checkbox("Keep me logged in on this device", value=True)
             if st.button(mode) and name and pin:
                 refresh()
                 users_now = load("Users", USER_COLS)
@@ -640,10 +703,17 @@ with tab_bet:
                             [name, hash_pin(pin), START_CREDITS], value_input_option="RAW")
                         refresh()
                         st.session_state.user = name
+                        st.session_state.logged_out = False
+                        if remember:
+                            st.session_state.cookie_todo = (make_token(name, hash_pin(pin)), COOKIE_DAYS)
                         st.rerun()
                 else:
                     if not match.empty and match.iloc[0]["PIN"] == hash_pin(pin):
                         st.session_state.user = match.iloc[0]["User"]
+                        st.session_state.logged_out = False
+                        if remember:
+                            st.session_state.cookie_todo = (
+                                make_token(match.iloc[0]["User"], match.iloc[0]["PIN"]), COOKIE_DAYS)
                         st.rerun()
                     else:
                         st.error("Name or PIN is wrong. Check both and try again.")
