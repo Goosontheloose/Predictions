@@ -15,7 +15,7 @@ START_CREDITS = 100
 TZ = ZoneInfo("Africa/Johannesburg")
 
 GAME_COLS = ["GameID", "Week", "Sport", "TeamA", "TeamB", "Handicap",
-             "OddsA", "OddsB", "OddsDraw", "Cutoff", "ScoreA", "ScoreB", "Winner", "Status"]
+             "OddsA", "OddsB", "OddsDraw", "Cutoff", "ScoreA", "ScoreB", "Winner", "Status", "Info"]
 USER_COLS = ["User", "PIN", "Credits"]
 BET_COLS = ["Week", "User", "GameID", "Pick", "Odds", "Stake", "Result", "Payout", "Placed"]
 LOCK_COLS = ["GameID", "User", "Locked"]   # one row per locked bet
@@ -260,12 +260,26 @@ def logo_files():
     return found
 
 
+# Logo files with these names are sport logos (rugby.png, cricket.png, darts.png),
+# shown next to the Sport name on a card instead of next to team names.
+SPORT_STEMS = {"rugby", "cricket", "darts", "soccer", "football", "tennis", "golf",
+               "boxing", "mma", "f1", "hockey", "netball", "basketball"}
+
+
+def sport_html(sport):
+    """Sport name with its logo in front, e.g. a darts logo before 'Darts Multi'."""
+    for word in re.findall(r"[a-z0-9]+", str(sport).lower()):
+        if word in SPORT_STEMS and logo_uri(word):
+            return f'<img class="slogo" src="{logo_uri(word)}" alt="">{esc(sport)}'
+    return esc(sport)
+
+
 def countries():
     """Known countries plus any extra logo file in the folder (e.g. kenya.png),
     so a new nation works just by uploading its logo."""
     info = dict(COUNTRY_INFO)
     for stem in logo_files():
-        if stem not in info:
+        if stem not in info and stem not in SPORT_STEMS:
             info[stem] = (stem.replace("_", " ")[:3].upper(), [stem.replace("_", " ")])
     return info
 
@@ -292,7 +306,8 @@ def find_country(text):
 
 
 def is_multi(g):
-    return str(g["Sport"]).strip().lower() == "multi"
+    """Any Sport with the word multi in it: Multi, Rugby Multi, Darts Multi..."""
+    return "multi" in str(g["Sport"]).lower()
 
 
 def multi_logos(text):
@@ -399,6 +414,10 @@ table.board tr.lead td:first-child { box-shadow: inset 4px 0 0 var(--flag); }
 .big { font-family: 'Barlow Condensed', 'Arial Narrow', sans-serif; font-size: 1.3rem; font-weight: 600; }
 .up { color: var(--turf); font-size: .85rem; margin-left: 4px; }
 .down { color: var(--loss); font-size: .85rem; margin-left: 4px; }
+.match .info { margin-top: 6px; padding: 6px 10px; background: #EEF4F0; border-radius: 6px;
+               color: var(--ink); font-size: .95rem; }
+img.slogo { height: 1.3em; width: auto; vertical-align: -0.3em; margin-right: 5px; }
+.game-head img.slogo, table.board img.slogo { height: 1.2em; }
 img.logo { height: 1.25em; width: auto; vertical-align: -0.2em; margin-right: 6px; }
 table.board img.logo { height: 1.15em; margin-right: 4px; }
 .multi { display: flex; align-items: center; gap: 10px; margin: 6px 0; flex-wrap: wrap; }
@@ -498,12 +517,15 @@ def pick_html(g, pick):
 
 def game_title_html(g):
     if is_multi(g):
-        return "Multi"
+        return sport_html(g["Sport"])
     b = f" v {with_logos(g['TeamB'])}" if str(g["TeamB"]).strip() else ""
     return with_logos(g["TeamA"]) + b
 
 
 def game_card_html(g):
+    info = g.get("Info", "")
+    info = "" if pd.isna(info) else str(info).strip()
+    info_html = f'<div class="info">ℹ️ {esc(info)}</div>' if info else ""
     h = num(g["Handicap"], 0)
     if is_multi(g):
         teams_html = ""
@@ -520,10 +542,33 @@ def game_card_html(g):
         teams_html = f'<div class="teams">{with_logos(g["TeamA"])}{a_h}{vs_part}</div>'
     return f"""
 <div class="match">
-  <div class="sport">{esc(g['Sport'])}</div>
+  <div class="sport">{sport_html(g['Sport'])}</div>
   {teams_html}
   <div class="close">{closes_text(g)}</div>
+  {info_html}
 </div>"""
+
+
+HELP_TEXT = """
+**Odds**: what you get back for each credit you bet. 10 credits at **1.9** pays back **19** if you win
+(your 10 plus 9 profit). If you lose, the 10 credits are gone.
+
+**Handicaps**: points added to or taken off a team to make the game even.
+Take **South Africa −26.5 v Italy +26.5**:
+- **South Africa −26.5** wins only if South Africa win by **27 or more**.
+- **Italy +26.5** wins if Italy win, draw, or lose by **26 or less**.
+
+The half point means there's never a tie. With a whole number like −7, a game decided by exactly 7
+is a tie on the handicap and everyone gets their credits back.
+
+**Multis**: several results on one bet with bigger odds. **Every** part must come true to win.
+Pick **A** or **B**; you can't back both.
+
+**Over / under**: e.g. *Italy over 20.5* wins if Italy score 21 or more; *under 20.5* wins on 20 or less.
+
+**Saving and locking**: you can change saved bets until kickoff. **Save and lock** makes a bet final and
+shows you what everyone else picked on that game.
+"""
 
 
 def save_picks(user, wgames, new, lock):
@@ -720,6 +765,8 @@ with tab_bet:
     else:
         if st.session_state.get("flash"):
             st.success(st.session_state.pop("flash"))
+        with st.expander("ℹ️ How odds, handicaps and multis work"):
+            st.markdown(HELP_TEXT)
         open_weeks = sorted({wk(g["Week"]) for g in open_all}, key=lambda w: num(w, 0))
         my_open = bets[(bets["User"] == user) & (bets["Result"].astype(str).str.strip() == "")]
         saved = {b["GameID"]: b for _, b in my_open.iterrows()}
@@ -918,7 +965,7 @@ with tab_mine:
                 pick = (f"{r['TeamA']}{hcp_txt(h)}" if r["Pick"] == "A"
                         else f"{r['TeamB']}{hcp_txt(-h)}" if r["Pick"] == "B" else "Draw")
                 if is_multi(r):
-                    game_cell = "Multi"
+                    game_cell = sport_html(r["Sport"])
                     pick_cell = f"{esc(r['Pick'])}: " + multi_logos(pick) if r["Pick"] in ("A", "B") else esc(pick)
                 else:
                     game_cell = (with_logos(r["TeamA"]) + (" v " + with_logos(r["TeamB"])
