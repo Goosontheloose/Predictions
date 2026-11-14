@@ -22,31 +22,81 @@ LOCK_COLS = ["GameID", "User", "Locked"]   # one row per locked bet
 
 
 # ---------------- GOOGLE SHEETS ----------------
+# Google allows about 60 reads per minute for the whole app (all players share it).
+# So all tabs are read in ONE request, kept for 45 seconds, and only re-read after
+# something changes. If Google still says "too many", the app waits and tries again.
+import time
+from gspread.exceptions import APIError
+from gspread.utils import numericise_all, rowcol_to_a1
+
+TABS = ["Games", "Users", "Bets", "BetLocks"]
+
+
+def with_retry(fn, *args, **kwargs):
+    """Runs a Google Sheets call; on a 'too many requests' error waits 3, 6, 12 s and retries."""
+    for wait in (3, 6, 12, None):
+        try:
+            return fn(*args, **kwargs)
+        except APIError as e:
+            code = getattr(getattr(e, "response", None), "status_code", None)
+            if code in (429, 500, 503) and wait:
+                time.sleep(wait)
+                continue
+            raise
+
+
 @st.cache_resource
 def get_book():
     scope = ["https://www.googleapis.com/auth/spreadsheets",
              "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(
         dict(st.secrets["connections"]["gsheets"]), scopes=scope)
-    return gspread.authorize(creds).open(SHEET_NAME)
+    return with_retry(gspread.authorize(creds).open, SHEET_NAME)
 
 
-@st.cache_data(ttl=30)
-def read_tab(name):
+@st.cache_resource
+def sheet_tabs():
+    """All tabs, looked up once (not on every page load). Makes BetLocks if missing."""
     book = get_book()
-    try:
-        ws = book.worksheet(name)
-    except gspread.WorksheetNotFound:
-        if name != "BetLocks":
-            raise
-        # The BetLocks tab is made automatically the first time it is needed
-        ws = book.add_worksheet(title="BetLocks", rows=1000, cols=len(LOCK_COLS))
-        ws.append_row(LOCK_COLS)
-    return ws.get_all_records()
+    tabs = {w.title: w for w in with_retry(book.worksheets)}
+    if "BetLocks" not in tabs:
+        w = with_retry(book.add_worksheet, title="BetLocks", rows=1000, cols=len(LOCK_COLS))
+        with_retry(w.append_row, LOCK_COLS)
+        tabs["BetLocks"] = w
+    return tabs
+
+
+def tab(name):
+    return sheet_tabs()[name]
+
+
+@st.cache_data(ttl=45)
+def read_all():
+    """Every tab in one request: {tab: (header, records)}."""
+    sheet_tabs()
+    res = with_retry(get_book().values_batch_get, [f"'{n}'" for n in TABS])
+    out = {}
+    for name, vr in zip(TABS, res.get("valueRanges", [])):
+        rows = vr.get("values", [])
+        if not rows:
+            out[name] = ([], [])
+            continue
+        header = [str(h).strip() for h in rows[0]]
+        records = []
+        for r in rows[1:]:
+            r = (list(r) + [""] * len(header))[:len(header)]
+            records.append(dict(zip(header, numericise_all(r))))
+        out[name] = (header, records)
+    return out
+
+
+def col_of(name, column):
+    """Column number of a header in a tab, e.g. col_of('Users', 'Credits') -> 3."""
+    return read_all()[name][0].index(column) + 1
 
 
 def load(name, cols):
-    df = pd.DataFrame(read_tab(name))
+    df = pd.DataFrame(read_all()[name][1])
     for c in cols:
         if c not in df.columns:
             df[c] = ""
@@ -56,15 +106,15 @@ def load(name, cols):
 
 
 def refresh():
-    st.cache_data.clear()
+    read_all.clear()
 
 
 def overwrite(name, df):
-    ws = get_book().worksheet(name)
-    ws.clear()
-    ws.update(range_name="A1",
-              values=[list(df.columns)] + df.astype(str).values.tolist(),
-              value_input_option="RAW")
+    ws = tab(name)
+    with_retry(ws.clear)
+    with_retry(ws.update, range_name="A1",
+               values=[list(df.columns)] + df.astype(str).values.tolist(),
+               value_input_option="RAW")
 
 
 # ---------------- HELPERS ----------------
@@ -148,8 +198,9 @@ def result_text(g):
     return "Draw" if num(g["OddsDraw"]) is not None else "Tie on handicap: stakes refunded"
 
 
-def settle_game(gid):
-    """Settles only the bets on one game. Returns number of bets settled."""
+def settle_games(gids):
+    """Settles the bets on these games in one go (one read, a few writes).
+    Returns the number of bets settled."""
     refresh()
     games = load("Games", GAME_COLS)
     users = load("Users", USER_COLS)
@@ -157,44 +208,51 @@ def settle_game(gid):
     games["GameID"] = games["GameID"].astype(str)
     bets["GameID"] = bets["GameID"].astype(str)
 
-    g_idx = games.index[games["GameID"] == gid][0]
-    g = games.loc[g_idx]
-    void = str(g["Status"]).strip().lower() == "void"
-    if str(g["Status"]).strip().lower() == "settled":
-        return 0  # already done by someone else
-    if not void and not has_scores(g):
-        return None
-
-    payouts, count = {}, 0
-    for i, b in bets.iterrows():
-        if b["GameID"] != gid or str(b["Result"]).strip():
+    payouts, count, done_rows = {}, 0, []
+    for gid in gids:
+        found = games.index[games["GameID"] == str(gid)]
+        if len(found) == 0:
             continue
-        stake = num(b["Stake"], 0)
-        if void:
-            result, pay = "Void", stake
-        else:
-            res = outcome(g)
-            if res == b["Pick"]:
-                result, pay = "Won", round(stake * num(b["Odds"], 0), 2)
-            elif res == "Draw" and num(g["OddsDraw"]) is None:
-                result, pay = "Push", stake
+        g_idx = found[0]
+        g = games.loc[g_idx]
+        status = str(g["Status"]).strip().lower()
+        void = status == "void"
+        if status == "settled":
+            continue  # already done by someone else
+        if not void and not has_scores(g):
+            continue
+
+        for i, b in bets.iterrows():
+            if b["GameID"] != str(gid) or str(b["Result"]).strip():
+                continue
+            stake = num(b["Stake"], 0)
+            if void:
+                result, pay = "Void", stake
             else:
-                result, pay = "Lost", 0
-        bets.at[i, "Result"] = result
-        bets.at[i, "Payout"] = pay
-        payouts[b["User"]] = payouts.get(b["User"], 0) + pay
-        count += 1
+                res = outcome(g)
+                if res == b["Pick"]:
+                    result, pay = "Won", round(stake * num(b["Odds"], 0), 2)
+                elif res == "Draw" and num(g["OddsDraw"]) is None:
+                    result, pay = "Push", stake
+                else:
+                    result, pay = "Lost", 0
+            bets.at[i, "Result"] = result
+            bets.at[i, "Payout"] = pay
+            payouts[b["User"]] = payouts.get(b["User"], 0) + pay
+            count += 1
+        if not void:
+            done_rows.append(int(g_idx) + 2)
 
-    for i, u in users.iterrows():
-        if u["User"] in payouts:
-            users.at[i, "Credits"] = round(num(u["Credits"], 0) + payouts[u["User"]], 2)
-
-    overwrite("Bets", bets)
-    overwrite("Users", users)
-    if not void:
-        ws = get_book().worksheet("Games")
-        col = ws.row_values(1).index("Status") + 1
-        ws.update_cell(g_idx + 2, col, "Settled")
+    if count:
+        for i, u in users.iterrows():
+            if u["User"] in payouts:
+                users.at[i, "Credits"] = round(num(u["Credits"], 0) + payouts[u["User"]], 2)
+        overwrite("Bets", bets)
+        overwrite("Users", users)
+    if done_rows:
+        col = col_of("Games", "Status")
+        with_retry(tab("Games").batch_update,
+                   [{"range": rowcol_to_a1(r, col), "values": [["Settled"]]} for r in done_rows])
     refresh()
     return count
 
@@ -597,18 +655,22 @@ def save_picks(user, wgames, new, lock):
         return f"These bets total {money(total)}, but you have {money(available)} credits."
 
     stamp = now().strftime("%Y-%m-%d %H:%M")
-    ws_b = get_book().worksheet("Bets")
-    for idx in sorted(old.index, reverse=True):  # bottom first so row numbers stay right
-        ws_b.delete_rows(int(idx) + 2)
+    ws_b = tab("Bets")
+    if len(old):
+        # all old rows removed in one request, bottom first so row numbers stay right
+        with_retry(get_book().batch_update, {"requests": [
+            {"deleteDimension": {"range": {"sheetId": ws_b.id, "dimension": "ROWS",
+                                           "startIndex": int(i) + 1, "endIndex": int(i) + 2}}}
+            for i in sorted(old.index, reverse=True)]})
     if new:
-        ws_b.append_rows([[g["Week"], user, g["GameID"], pk, odds, stake, "", "", stamp]
-                          for g, pk, odds, stake in new], value_input_option="RAW")
-    ws_u = get_book().worksheet("Users")
-    col = ws_u.row_values(1).index("Credits") + 1
-    ws_u.update_cell(int(row) + 2, col, round(available - total, 2))
+        with_retry(ws_b.append_rows,
+                   [[g["Week"], user, g["GameID"], pk, odds, stake, "", "", stamp]
+                    for g, pk, odds, stake in new], value_input_option="RAW")
+    with_retry(tab("Users").update_cell, int(row) + 2, col_of("Users", "Credits"),
+               round(available - total, 2))
     if lock and new:
-        get_book().worksheet("BetLocks").append_rows(
-            [[g["GameID"], user, stamp] for g, *_ in new], value_input_option="RAW")
+        with_retry(tab("BetLocks").append_rows,
+                   [[g["GameID"], user, stamp] for g, *_ in new], value_input_option="RAW")
     refresh()
     return None
 
@@ -690,10 +752,14 @@ if "cookie_todo" in st.session_state:
 # anyone opens the app. The app then changes the Status to "Settled".
 to_settle = [g["GameID"] for _, g in games.iterrows()
              if str(g["Status"]).strip().lower() == "settle" and has_scores(g)]
-if to_settle:
-    for gid in to_settle:
-        settle_game(gid)
-    st.rerun()
+if to_settle and not st.session_state.get("settle_failed"):
+    try:
+        settle_games(to_settle)
+    except Exception:
+        # Don't crash the page; another visit will try again shortly
+        st.session_state.settle_failed = True
+    else:
+        st.rerun()
 
 user = st.session_state.user
 me = users[users["User"] == user] if user else users.iloc[0:0]
@@ -717,7 +783,7 @@ st.markdown(f"""
 
 if user:
     _, c = st.columns([5, 1])
-    if c.button("Log out", use_container_width=True):
+    if c.button("Log out", width="stretch"):
         st.session_state.user = None
         st.session_state.logged_out = True
         st.session_state.cookie_todo = ("", 0)   # delete the remember-me cookie
@@ -744,8 +810,8 @@ with tab_bet:
                     if not match.empty:
                         st.error("That name is taken. Pick another one.")
                     else:
-                        get_book().worksheet("Users").append_row(
-                            [name, hash_pin(pin), START_CREDITS], value_input_option="RAW")
+                        with_retry(tab("Users").append_row,
+                                   [name, hash_pin(pin), START_CREDITS], value_input_option="RAW")
                         refresh()
                         st.session_state.user = name
                         st.session_state.logged_out = False
@@ -834,8 +900,8 @@ with tab_bet:
                             unsafe_allow_html=True)
                 sure = st.checkbox("I’m sure, lock these bets", key=f"sure{week}")
                 b1, b2 = st.columns(2)
-                save = b1.button("Save picks", key=f"save{week}", use_container_width=True)
-                lock = b2.button("Save and lock 🔒", key=f"lock{week}", use_container_width=True)
+                save = b1.button("Save picks", key=f"save{week}", width="stretch")
+                lock = b2.button("Save and lock 🔒", key=f"lock{week}", width="stretch")
 
             if save or lock:
                 if lock and not sure:
@@ -993,7 +1059,7 @@ with tab_admin:
             else ("Bad cutoff format" if parse_cutoff(g["Cutoff"]) is None
                   and str(g["Status"]).strip().lower() not in ("settled", "void")
                   else "Closed"), axis=1)
-        st.dataframe(view, hide_index=True, use_container_width=True)
+        st.dataframe(view.astype(str), hide_index=True, width="stretch")
 
         st.subheader("Settle a game")
         st.caption("Games appear here once they have both scores, a Winner (A, B, C or Draw), or Status set to Void.")
@@ -1011,7 +1077,7 @@ with tab_admin:
             n_bets = int((bets["GameID"] == g["GameID"]).sum())
             st.write(f"Result: **{result_text(g)}** ({n_bets} bets)")
             if st.button("Settle this game"):
-                n = settle_game(g["GameID"])
+                n = settle_games([g["GameID"]])
                 st.success(f"Settled {n} bets on game #{g['GameID']}.")
                 st.rerun()
 
